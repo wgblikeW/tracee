@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -17,16 +15,15 @@ import (
 	"github.com/aquasecurity/tracee/cmd/tracee-ebpf/internal/printer"
 	tracee "github.com/aquasecurity/tracee/pkg/ebpf"
 	"github.com/aquasecurity/tracee/pkg/events"
+	"github.com/aquasecurity/tracee/pkg/logger"
+	"github.com/aquasecurity/tracee/pkg/server"
 	"github.com/aquasecurity/tracee/types/trace"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	cli "github.com/urfave/cli/v2"
 )
 
 var traceeInstallPath string
-var listenMetrics bool
-var metricsAddr string
 var enrich bool
-
 var version string
 
 func main() {
@@ -57,17 +54,29 @@ func main() {
 			// for the rest of execution, use this debug mode value
 			debug := debug.Enabled()
 
+			// Avoiding to override package-level logger
+			// when it's already set by logger environment variables
+			if !logger.IsSetFromEnv() {
+				// Logger Setup
+				logger.Init(
+					&logger.LoggerConfig{
+						Writer:    os.Stderr,
+						Level:     logger.InfoLevel,
+						Encoder:   logger.NewJSONEncoder(logger.NewProductionConfig().EncoderConfig),
+						Aggregate: false,
+					},
+				)
+			}
+
 			// OS release information
 
 			OSInfo, err := helpers.GetOSInfo()
-			if debug {
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "OSInfo: warning: os-release file could not be found\n(%v)\n", err) // only to be enforced when BTF needs to be downloaded, later on
-					fmt.Fprintf(os.Stdout, "OSInfo: %v: %v\n", helpers.OS_KERNEL_RELEASE, OSInfo.GetOSReleaseFieldValue(helpers.OS_KERNEL_RELEASE))
-				} else {
-					for k, v := range OSInfo.GetOSReleaseAllFieldValues() {
-						fmt.Fprintf(os.Stdout, "OSInfo: %v: %v\n", k, v)
-					}
+			if err != nil {
+				logger.Debug("osinfo: warning: os-release file could not be found", "error", err) // only to be enforced when BTF needs to be downloaded, later on
+				logger.Debug("osinfo", "os_realease_field", helpers.OS_KERNEL_RELEASE, "OS_KERNEL_RELEASE", OSInfo.GetOSReleaseFieldValue(helpers.OS_KERNEL_RELEASE))
+			} else {
+				for k, v := range OSInfo.GetOSReleaseAllFieldValues() {
+					logger.Debug("osinfo", "OSReleaseField", k, "OS_KERNEL_RELEASE", v)
 				}
 			}
 
@@ -100,8 +109,8 @@ func main() {
 				return err
 			}
 			cfg.Cache = cache
-			if debug && cfg.Cache != nil {
-				fmt.Fprintf(os.Stdout, "Cache: cache type is \"%s\"\n", cfg.Cache)
+			if cfg.Cache != nil {
+				logger.Debug("cache", "type", cfg.Cache.String())
 			}
 
 			captureSlice := c.StringSlice("capture")
@@ -164,16 +173,14 @@ func main() {
 			if err == nil && lockdown == helpers.CONFIDENTIALITY {
 				return fmt.Errorf("kernel lockdown is set to 'confidentiality', can't load eBPF programs")
 			}
-			if debug {
-				fmt.Fprintf(os.Stdout, "OSInfo: Security Lockdown is '%v'\n", lockdown)
-			}
+			logger.Debug("osinfo", "security_lockdown", lockdown)
 
 			enabled, err := helpers.FtraceEnabled()
 			if err != nil {
 				return err
 			}
 			if !enabled {
-				fmt.Fprintf(os.Stderr, "ftrace_enabled: warning: ftrace is not enabled, kernel events won't be caught, make sure to enable it by executing echo 1 | sudo tee /proc/sys/kernel/ftrace_enabled")
+				logger.Error("ftrace_enabled: ftrace is not enabled, kernel events won't be caught, make sure to enable it by executing echo 1 | sudo tee /proc/sys/kernel/ftrace_enabled")
 			}
 
 			// OS kconfig information
@@ -198,37 +205,27 @@ func main() {
 				return fmt.Errorf("error creating Tracee: %v", err)
 			}
 
-			if listenMetrics {
-				err := t.Stats().RegisterPrometheus()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error registering prometheus metrics: %v\n", err)
-				} else {
-					mux := http.NewServeMux()
-					mux.Handle("/metrics", promhttp.Handler())
+			if server.ShouldStart(c) {
+				httpServer := server.New(c.String(server.ListenEndpointFlag), debug)
 
-					go func() {
-						if debug {
-							fmt.Fprintf(os.Stdout, "Serving metrics endpoint at %s\n", metricsAddr)
-						}
-						if err := http.ListenAndServe(metricsAddr, mux); err != http.ErrServerClosed {
-							fmt.Fprintf(os.Stderr, "Error serving metrics endpoint: %v\n", err)
-						}
-					}()
+				if c.Bool(server.MetricsEndpointFlag) {
+					err := t.Stats().RegisterPrometheus()
+					if err != nil {
+						logger.Error("registering prometheus metrics", "error", err)
+					} else {
+						httpServer.EnableMetricsEndpoint()
+					}
 				}
 
-			}
+				if c.Bool(server.HealthzEndpointFlag) {
+					httpServer.EnableHealthzEndpoint()
+				}
 
-			if printerConfig.OutFile == nil {
-				printerConfig.OutFile, err = os.OpenFile(printerConfig.OutPath, os.O_WRONLY, 0755)
-				if err != nil {
-					return err
+				if c.Bool(server.PProfEndpointFlag) {
+					httpServer.EnablePProfEndpoint()
 				}
-			}
-			if printerConfig.ErrFile == nil {
-				printerConfig.ErrFile, err = os.OpenFile(printerConfig.ErrPath, os.O_WRONLY, 0755)
-				if err != nil {
-					return err
-				}
+
+				go httpServer.Start()
 			}
 
 			printer, err := printer.New(printerConfig)
@@ -344,16 +341,24 @@ func main() {
 				Destination: &traceeInstallPath,
 			},
 			&cli.BoolFlag{
-				Name:        "metrics",
-				Usage:       "enable metrics endpoint",
-				Destination: &listenMetrics,
-				Value:       false,
+				Name:  server.MetricsEndpointFlag,
+				Usage: "enable metrics endpoint",
+				Value: false,
+			},
+			&cli.BoolFlag{
+				Name:  server.HealthzEndpointFlag,
+				Usage: "enable healthz endpoint",
+				Value: false,
+			},
+			&cli.BoolFlag{
+				Name:  server.PProfEndpointFlag,
+				Usage: "enables pprof endpoints",
+				Value: false,
 			},
 			&cli.StringFlag{
-				Name:        "metrics-addr",
-				Usage:       "listening address of the metrics endpoint server",
-				Value:       ":3366",
-				Destination: &metricsAddr,
+				Name:  server.ListenEndpointFlag,
+				Usage: "listening address of the metrics endpoint server",
+				Value: ":3366",
 			},
 			&cli.BoolFlag{
 				Name:        "containers",
@@ -370,7 +375,7 @@ func main() {
 
 	err := app.Run(os.Args)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal("app", "error", err)
 	}
 }
 
@@ -418,7 +423,6 @@ func printList() {
 	b.WriteString("System Calls: " + titleHeaderPadFirst + "Sets:" + titleHeaderPadSecond + "Arguments:\n")
 	b.WriteString("____________  " + titleHeaderPadFirst + "____ " + titleHeaderPadSecond + "_________" + "\n\n")
 	printEventGroup(&b, 0, events.MaxSyscallID)
-	printEventGroup(&b, events.Unique32BitSyscallsStartID, events.Unique32BitSyscallsEndID)
 	b.WriteString("\n\nOther Events: " + titleHeaderPadFirst + "Sets:" + titleHeaderPadSecond + "Arguments:\n")
 	b.WriteString("____________  " + titleHeaderPadFirst + "____ " + titleHeaderPadSecond + "_________\n\n")
 	printEventGroup(&b, events.SysEnter, events.MaxCommonID)
@@ -436,7 +440,7 @@ func printEventGroup(b *strings.Builder, firstEventID, lastEventID events.ID) {
 			continue
 		}
 		if event.Sets != nil {
-			eventSets := fmt.Sprintf("%-22s %-40s %s\n", event.Name, fmt.Sprintf("%v", event.Sets), getFormattedEventParams(i))
+			eventSets := fmt.Sprintf("%-28s %-40s %s\n", event.Name, fmt.Sprintf("%v", event.Sets), getFormattedEventParams(i))
 			b.WriteString(eventSets)
 		} else {
 			b.WriteString(event.Name + "\n")

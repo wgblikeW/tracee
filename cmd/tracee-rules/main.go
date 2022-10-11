@@ -4,9 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"net/http"
-	"net/http/pprof"
 	"os"
 	"os/signal"
 	"sort"
@@ -14,18 +11,18 @@ import (
 	"syscall"
 
 	"github.com/aquasecurity/tracee/pkg/capabilities"
+	"github.com/aquasecurity/tracee/pkg/logger"
 	"github.com/aquasecurity/tracee/pkg/rules/engine"
+	"github.com/aquasecurity/tracee/pkg/server"
 	"github.com/aquasecurity/tracee/types/detect"
+
 	"github.com/open-policy-agent/opa/compile"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/urfave/cli/v2"
 	"kernel.org/pub/linux/libs/security/libcap/cap"
 )
 
 const (
 	signatureBufferFlag       = "sig-buffer"
-	metricsFlag               = "metrics"
-	metricsAddrFlag           = "metrics-addr"
 	allowHighCapabilitiesFlag = "allow-high-capabilities"
 )
 
@@ -34,52 +31,52 @@ func main() {
 		Name:  "tracee-rules",
 		Usage: "A rule engine for Runtime Security",
 		Action: func(c *cli.Context) error {
-			err := dropCapabilities()
-			if err != nil {
-				if !c.Bool(allowHighCapabilitiesFlag) {
-					return fmt.Errorf("%w - to avoid this error use the --%s flag", err, allowHighCapabilitiesFlag)
-				} else {
-					fmt.Fprintf(os.Stdout, "Capabilities dropping failed - %v\n", err)
-					fmt.Fprintf(os.Stdout, "Continue with high capabilities according to the configuration\n")
-				}
-			}
-
 			if c.NumFlags() == 0 {
 				cli.ShowAppHelp(c)
 				return errors.New("no flags specified")
 			}
 
-			if c.Bool("pprof") {
-				mux := http.NewServeMux()
-				mux.HandleFunc("/debug/pprof/", pprof.Index)
-				mux.Handle("/debug/pprof/allocs", pprof.Handler("allocs"))
-				mux.Handle("/debug/pprof/block", pprof.Handler("block"))
-				mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
-				mux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
-				mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-				mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-				mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-				mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-				go func() {
-					addr := c.String("pprof-addr")
-					fmt.Fprintf(os.Stdout, "Serving pprof endpoints at %s\n", addr)
-					if err := http.ListenAndServe(addr, mux); err != http.ErrServerClosed {
-						fmt.Fprintf(os.Stderr, "Error serving pprof endpoints: %v\n", err)
-					}
-				}()
+			// Avoiding to override package-level logger
+			// when it's already set by logger environment variables
+			if !logger.IsSetFromEnv() {
+				// Logger Setup
+				logger.Init(
+					&logger.LoggerConfig{
+						Writer:    os.Stderr,
+						Level:     logger.InfoLevel,
+						Encoder:   logger.NewJSONEncoder(logger.NewProductionConfig().EncoderConfig),
+						Aggregate: false,
+					},
+				)
+			}
+
+			err := dropCapabilities()
+			if err != nil {
+				if !c.Bool(allowHighCapabilitiesFlag) {
+					return fmt.Errorf("%w - to avoid this error use the --%s flag", err, allowHighCapabilitiesFlag)
+				}
+
+				logger.Error("capabilities dropping failed", "error", err)
+				logger.Info("continue with high capabilities according to the configuration")
 			}
 
 			var target string
 			switch strings.ToLower(c.String("rego-runtime-target")) {
 			case "wasm":
-				return errors.New("target unsupported: " + target)
+				return errors.New("target unsupported: wasm")
 			case "rego":
 				target = compile.TargetRego
 			default:
-				return errors.New("invalid target specified " + target)
+				return fmt.Errorf("invalid target specified: %s", strings.ToLower(c.String("rego-runtime-target")))
 			}
 
-			sigs, err := getSignatures(target, c.Bool("rego-partial-eval"), c.String("rules-dir"), c.StringSlice("rules"), c.Bool("rego-aio"))
+			sigs, err := getSignatures(
+				target,
+				c.Bool("rego-partial-eval"),
+				c.String("rules-dir"),
+				c.StringSlice("rules"),
+				c.Bool("rego-aio"),
+			)
 			if err != nil {
 				return err
 			}
@@ -88,7 +85,7 @@ func main() {
 			for _, s := range sigs {
 				m, err := s.GetMetadata()
 				if err != nil {
-					log.Printf("failed to load signature: %v", err)
+					logger.Error("failed to load signature", "error", err)
 					continue
 				}
 				loadedSigIDs = append(loadedSigIDs, m.ID)
@@ -102,10 +99,12 @@ func main() {
 			fmt.Printf("Loaded %d signature(s): %s\n", len(loadedSigIDs), loadedSigIDs)
 
 			if c.Bool("list") {
-				return listSigs(os.Stdout, sigs)
+				listSigs(os.Stdout, sigs)
+				return nil
 			}
 
 			var inputs engine.EventSources
+
 			opts, err := parseTraceeInputOptions(c.StringSlice("input-tracee"))
 			if err == errHelp {
 				printHelp()
@@ -114,12 +113,19 @@ func main() {
 			if err != nil {
 				return err
 			}
+
 			inputs.Tracee, err = setupTraceeInputSource(opts)
 			if err != nil {
 				return err
 			}
 
-			output, err := setupOutput(os.Stdout, c.String("webhook"), c.String("webhook-template"), c.String("webhook-content-type"), c.String("output-template"))
+			output, err := setupOutput(
+				os.Stdout,
+				c.String("webhook"),
+				c.String("webhook-template"),
+				c.String("webhook-content-type"),
+				c.String("output-template"),
+			)
 			if err != nil {
 				return err
 			}
@@ -132,26 +138,31 @@ func main() {
 				return fmt.Errorf("constructing engine: %w", err)
 			}
 
-			if c.Bool(metricsFlag) {
-				err := e.Stats().RegisterPrometheus()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error registering prometheus metrics: %v\n", err)
-				} else {
-					mux := http.NewServeMux()
-					mux.Handle("/metrics", promhttp.Handler())
+			if server.ShouldStart(c) {
+				httpServer := server.New(c.String(server.ListenEndpointFlag), false)
 
-					go func() {
-						metricsAddr := c.String(metricsAddrFlag)
-						fmt.Fprintf(os.Stdout, "Serving metrics endpoint at %s\n", metricsAddr)
-						if err := http.ListenAndServe(metricsAddr, mux); err != http.ErrServerClosed {
-							fmt.Fprintf(os.Stderr, "Error serving metrics endpoint: %v\n", err)
-						}
-					}()
+				if c.Bool(server.MetricsEndpointFlag) {
+					err := e.Stats().RegisterPrometheus()
+					if err != nil {
+						logger.Error("registering prometheus metrics", "error", err)
+					} else {
+						httpServer.EnableMetricsEndpoint()
+					}
 				}
 
+				if c.Bool(server.HealthzEndpointFlag) {
+					httpServer.EnableHealthzEndpoint()
+				}
+
+				if c.Bool(server.PProfEndpointFlag) {
+					httpServer.EnablePProfEndpoint()
+				}
+
+				go httpServer.Start()
 			}
 
 			e.Start(sigHandler())
+
 			return nil
 		},
 		Flags: []cli.Flag{
@@ -192,13 +203,9 @@ func main() {
 				Usage: "configure output format via templates. Usage: --output-template=path/to/my.tmpl",
 			},
 			&cli.BoolFlag{
-				Name:  "pprof",
+				Name:  server.PProfEndpointFlag,
 				Usage: "enables pprof endpoints",
-			},
-			&cli.StringFlag{
-				Name:  "pprof-addr",
-				Usage: "listening address of the pprof endpoints server",
-				Value: ":7777",
+				Value: false,
 			},
 			&cli.BoolFlag{
 				Name:  "rego-aio",
@@ -219,12 +226,17 @@ func main() {
 				Value: 1000,
 			},
 			&cli.BoolFlag{
-				Name:  metricsFlag,
+				Name:  server.MetricsEndpointFlag,
 				Usage: "enable metrics endpoint",
 				Value: false,
 			},
+			&cli.BoolFlag{
+				Name:  server.HealthzEndpointFlag,
+				Usage: "enable healthz endpoint",
+				Value: false,
+			},
 			&cli.StringFlag{
-				Name:  metricsAddrFlag,
+				Name:  server.ListenEndpointFlag,
 				Usage: "listening address of the metrics endpoint server",
 				Value: ":4466",
 			},
@@ -238,11 +250,11 @@ func main() {
 	}
 	err := app.Run(os.Args)
 	if err != nil {
-		log.Fatal(err)
+		logger.Fatal("app", "error", err)
 	}
 }
 
-func listSigs(w io.Writer, sigs []detect.Signature) error {
+func listSigs(w io.Writer, sigs []detect.Signature) {
 	fmt.Fprintf(w, "%-10s %-35s %s %s\n", "ID", "NAME", "VERSION", "DESCRIPTION")
 	for _, sig := range sigs {
 		meta, err := sig.GetMetadata()
@@ -251,7 +263,6 @@ func listSigs(w io.Writer, sigs []detect.Signature) error {
 		}
 		fmt.Fprintf(w, "%-10s %-35s %-7s %s\n", meta.ID, meta.Name, meta.Version, meta.Description)
 	}
-	return nil
 }
 
 func listEvents(w io.Writer, sigs []detect.Signature) {
@@ -288,9 +299,5 @@ func sigHandler() chan bool {
 // dropCapabilities drop all capabilities from the process
 // The function also tries to drop the capabilities bounding set, but it won't work if CAP_SETPCAP is not available.
 func dropCapabilities() error {
-	err := capabilities.DropUnrequired([]cap.Value{})
-	if err != nil {
-		return err
-	}
-	return nil
+	return capabilities.DropUnrequired([]cap.Value{})
 }

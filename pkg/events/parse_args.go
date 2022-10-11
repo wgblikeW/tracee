@@ -256,7 +256,6 @@ func GetArg(event *trace.Event, argName string) *trace.Argument {
 var kernelReadFileIdStrs map[int32]string
 
 func init() {
-
 	osInfo, err := helpers.GetOSInfo()
 	if err != nil {
 		return
@@ -324,7 +323,6 @@ func init() {
 			7: "x509-certificate",
 		}
 	}
-
 }
 
 func parseKernelReadFileId(id int32) (string, error) {
@@ -333,4 +331,16 @@ func parseKernelReadFileId(id int32) (string, error) {
 		return "", fmt.Errorf("kernelReadFileId doesn't exist in kernelReadFileIdStrs map")
 	}
 	return kernelReadFileIdStr, nil
+}
+
+type CustomFunctionArgument struct {
+	val uint64
+	str string
+}
+
+func (arg CustomFunctionArgument) String() string {
+	return arg.str
+}
+func (arg CustomFunctionArgument) Value() uint64 {
+	return arg.val
 }
